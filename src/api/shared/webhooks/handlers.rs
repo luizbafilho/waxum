@@ -74,9 +74,11 @@ pub async fn register_webhook(
         .map_err(|e| ApiError::Internal(e.to_string()))?
         .ok_or_else(|| ApiError::SessionNotFound(session_id.clone()))?;
 
-    crate::net_guard::validate_public_url(&request.url)
-        .await
-        .map_err(ApiError::BadRequest)?;
+    if !*crate::net_guard::PRIVATE_WEBHOOKS_ALLOWED {
+        crate::net_guard::validate_public_url(&request.url)
+            .await
+            .map_err(ApiError::BadRequest)?;
+    }
 
     let existing = state.get_webhooks(&session_id);
     if existing.iter().any(|(_, w)| w.url == request.url) {

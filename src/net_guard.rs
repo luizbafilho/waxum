@@ -31,6 +31,15 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use once_cell::sync::Lazy;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 
+/// `WEBHOOK_ALLOW_PRIVATE_TARGETS=true` lets webhooks reach loopback and
+/// private addresses, for single-operator installs whose consumer runs on
+/// the same host or LAN. Off by default; media-by-URL stays guarded.
+pub static PRIVATE_WEBHOOKS_ALLOWED: Lazy<bool> = Lazy::new(|| {
+    std::env::var("WEBHOOK_ALLOW_PRIVATE_TARGETS")
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+});
+
 /// Validates `raw_url`'s scheme and resolves its host, rejecting anything
 /// that isn't a publicly-routable `http`/`https` target. Intended for
 /// eager validation (e.g. at webhook registration); does not by itself

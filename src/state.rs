@@ -142,14 +142,17 @@ fn webhook_retry_delay(attempt: usize) -> Duration {
 fn webhook_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
+        let builder = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
             .connect_timeout(Duration::from_secs(5))
             .pool_idle_timeout(Duration::from_secs(90))
-            .pool_max_idle_per_host(16)
-            .dns_resolver(std::sync::Arc::new(crate::net_guard::SsrfSafeResolver))
-            .build()
-            .unwrap_or_else(|_| reqwest::Client::new())
+            .pool_max_idle_per_host(16);
+        let builder = if *crate::net_guard::PRIVATE_WEBHOOKS_ALLOWED {
+            builder
+        } else {
+            builder.dns_resolver(std::sync::Arc::new(crate::net_guard::SsrfSafeResolver))
+        };
+        builder.build().unwrap_or_else(|_| reqwest::Client::new())
     })
 }
 
