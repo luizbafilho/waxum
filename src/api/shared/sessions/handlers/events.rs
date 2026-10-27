@@ -565,6 +565,8 @@ pub(super) fn message_event_data(
         "from_phone": from_phone,
         "chat": info.source.chat.to_string(),
         "chat_phone": chat_phone,
+        "sender_alt": info.source.sender_alt.as_ref().map(|j| j.to_string()),
+        "recipient_alt": info.source.recipient_alt.as_ref().map(|j| j.to_string()),
         "quoted_message_id": quoted_message_id,
         "quoted_sender_jid": quoted_sender_jid,
         "message_id": info.id.to_string(),
@@ -1091,8 +1093,18 @@ pub(super) fn event_to_json(
             None => serde_json::json!({}),
         },
         Event::Receipt(receipt) => {
+            let source = &receipt.source;
             serde_json::json!({
                 "receipt": format!("{:?}", receipt),
+                "chat": source.chat.to_string(),
+                "sender": source.sender.to_string(),
+                "sender_alt": source.sender_alt.as_ref().map(|j| j.to_string()),
+                "is_from_me": source.is_from_me,
+                "is_group": source.is_group,
+                "message_ids": receipt.message_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
+                "type": receipt.r#type,
+                "timestamp": receipt.timestamp.timestamp(),
+                "offline": receipt.offline,
             })
         }
         Event::Presence(presence) => {
