@@ -560,6 +560,9 @@ pub(super) fn message_event_data(
         .as_ref()
         .filter(|s| s.flow_name.is_some() || s.flow_params.is_some())
         .map(|s| serde_json::json!({ "name": s.flow_name, "params": s.flow_params }));
+    let choices = extract_interactive_offer(msg)
+        .map(|offer| offer.choices)
+        .filter(|choices| !choices.is_empty());
     serde_json::json!({
         "from": info.source.sender.to_string(),
         "from_phone": from_phone,
@@ -585,6 +588,7 @@ pub(super) fn message_event_data(
         "selected_id": selection.as_ref().and_then(|s| s.id.clone()),
         "selected_text": selection.as_ref().and_then(|s| s.text.clone()),
         "native_flow": native_flow,
+        "choices": choices,
         "is_group": info.source.chat.to_string().ends_with("@g.us"),
         "participant": info.source.sender.to_string(),
     })
@@ -634,7 +638,8 @@ pub(super) async fn resolve_jid_phone(
 /// A tap on a button or list row is typed by the response kind (see
 /// [`extract_interactive_selection`]) with `text` set to the chosen label,
 /// falling back to the chosen id, so consumers that only read `text` still
-/// see what was picked.
+/// see what was picked. A message that offers buttons or a list is typed by
+/// its kind (see [`extract_interactive_offer`]) with `text` set to its body.
 pub(crate) fn extract_message_content(
     msg: &waproto::whatsapp::Message,
 ) -> (Option<String>, Option<String>, String, Option<String>) {
@@ -714,12 +719,9 @@ pub(crate) fn extract_message_content(
                 .reaction_message
                 .as_option()
                 .and_then(|r| r.text.clone());
-        } else if msg.buttons_message.is_set() {
-            message_type = "buttons".to_string();
-        } else if msg.list_message.is_set() {
-            message_type = "list".to_string();
-        } else if msg.template_message.is_set() {
-            message_type = "template".to_string();
+        } else if let Some(offer) = extract_interactive_offer(msg) {
+            message_type = offer.kind.to_string();
+            text = offer.text;
         } else if let Some(selection) = extract_interactive_selection(msg) {
             message_type = selection.kind.to_string();
             text = selection.text.or(selection.id);
@@ -826,6 +828,150 @@ pub(crate) fn extract_interactive_selection(
         });
     }
     None
+}
+
+/// A message that offers the user buttons or list rows to tap.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct InteractiveOffer {
+    /// `template`, `buttons`, `list` or `interactive` -- also used as the
+    /// event's `message_type`.
+    pub kind: &'static str,
+    /// The body the user reads above the choices.
+    pub text: Option<String>,
+    /// The choices that send a reply when tapped, in display order. URL,
+    /// call and other non-reply buttons are left out.
+    pub choices: Vec<OfferedChoice>,
+}
+
+/// One tappable choice; `id` is what the reply carries back as
+/// `selected_id`.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub(crate) struct OfferedChoice {
+    pub id: String,
+    pub text: String,
+    pub index: u32,
+}
+
+/// Reads the body and reply choices out of a template, buttons, list or
+/// native-flow interactive message. `None` for every other message kind.
+pub(crate) fn extract_interactive_offer(
+    msg: &waproto::whatsapp::Message,
+) -> Option<InteractiveOffer> {
+    use waproto::whatsapp::hydrated_template_button::HydratedButton;
+    use waproto::whatsapp::message::interactive_message::InteractiveMessage;
+
+    let msg = msg.get_base_message();
+    if let Some(t) = msg.template_message.as_option() {
+        let hydrated = hydrated_template(t);
+        let choices = hydrated
+            .map(|h| h.hydrated_buttons.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .enumerate()
+            .filter_map(|(position, button)| match &button.hydrated_button {
+                Some(HydratedButton::QuickReplyButton(q)) => Some(OfferedChoice {
+                    id: q.id.clone().unwrap_or_default(),
+                    text: q.display_text.clone().unwrap_or_default(),
+                    index: button.index.unwrap_or(position as u32),
+                }),
+                _ => None,
+            })
+            .collect();
+        return Some(InteractiveOffer {
+            kind: "template",
+            text: hydrated.and_then(|h| h.hydrated_content_text.clone()),
+            choices,
+        });
+    }
+    if let Some(b) = msg.buttons_message.as_option() {
+        return Some(InteractiveOffer {
+            kind: "buttons",
+            text: b.content_text.clone(),
+            choices: b
+                .buttons
+                .iter()
+                .enumerate()
+                .map(|(position, button)| OfferedChoice {
+                    id: button.button_id.clone().unwrap_or_default(),
+                    text: button
+                        .button_text
+                        .as_option()
+                        .and_then(|t| t.display_text.clone())
+                        .unwrap_or_default(),
+                    index: position as u32,
+                })
+                .collect(),
+        });
+    }
+    if let Some(l) = msg.list_message.as_option() {
+        let text = [l.title.as_deref(), l.description.as_deref()]
+            .into_iter()
+            .flatten()
+            .filter(|part| !part.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Some(InteractiveOffer {
+            kind: "list",
+            text: Some(text).filter(|t| !t.is_empty()),
+            choices: l
+                .sections
+                .iter()
+                .flat_map(|section| section.rows.iter())
+                .enumerate()
+                .map(|(position, row)| OfferedChoice {
+                    id: row.row_id.clone().unwrap_or_default(),
+                    text: row.title.clone().unwrap_or_default(),
+                    index: position as u32,
+                })
+                .collect(),
+        });
+    }
+    if let Some(i) = msg.interactive_message.as_option() {
+        let buttons = match &i.interactive_message {
+            Some(InteractiveMessage::NativeFlowMessage(n)) => n.buttons.as_slice(),
+            _ => &[],
+        };
+        let choices = buttons
+            .iter()
+            .filter(|button| button.name.as_deref() == Some("quick_reply"))
+            .enumerate()
+            .filter_map(|(position, button)| {
+                let params: serde_json::Value =
+                    serde_json::from_str(button.button_params_json.as_deref()?).ok()?;
+                let field = |key: &str| params.get(key)?.as_str().map(str::to_string);
+                Some(OfferedChoice {
+                    id: field("id").unwrap_or_default(),
+                    text: field("display_text").unwrap_or_default(),
+                    index: position as u32,
+                })
+            })
+            .collect();
+        return Some(InteractiveOffer {
+            kind: "interactive",
+            text: i.body.as_option().and_then(|b| b.text.clone()),
+            choices,
+        });
+    }
+    None
+}
+
+/// The hydrated form of a template, wherever the proto put it: the
+/// `hydratedTemplate` field, the `hydratedFourRowTemplate` format, or the
+/// hydrated HSM behind a `fourRowTemplate`'s content.
+fn hydrated_template(
+    t: &waproto::whatsapp::message::TemplateMessage,
+) -> Option<&waproto::whatsapp::message::template_message::HydratedFourRowTemplate> {
+    use waproto::whatsapp::message::template_message::Format;
+
+    t.hydrated_template.as_option().or(match &t.format {
+        Some(Format::HydratedFourRowTemplate(h)) => Some(h.as_ref()),
+        Some(Format::FourRowTemplate(f)) => f
+            .content
+            .as_option()
+            .and_then(|c| c.hydrated_hsm.as_option())
+            .and_then(hydrated_template),
+        _ => None,
+    })
 }
 
 /// Extracts the WhatsApp reply/quote linkage (`ContextInfo.stanzaId` +
@@ -1537,6 +1683,246 @@ mod tests {
             assert_eq!(data["selected_id"], serde_json::Value::Null);
             assert_eq!(data["selected_text"], serde_json::Value::Null);
             assert_eq!(data["native_flow"], serde_json::Value::Null);
+        }
+    }
+
+    mod interactive_offers {
+        use super::super::*;
+        use serde_json::json;
+        use waproto::buffa::MessageField;
+        use waproto::whatsapp::message as wm;
+        use waproto::whatsapp::{hydrated_template_button as htb, HydratedTemplateButton, Message};
+
+        fn info() -> wacore::types::message::MessageInfo {
+            wacore::types::message::MessageInfo {
+                source: wacore::types::message::MessageSource {
+                    chat: "628123456789@s.whatsapp.net".parse().unwrap(),
+                    sender: "628123456789@s.whatsapp.net".parse().unwrap(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        }
+
+        fn quick_reply(id: &str, label: &str, index: u32) -> HydratedTemplateButton {
+            nx!(HydratedTemplateButton {
+                index: Some(index),
+                hydrated_button: Some(htb::HydratedButton::QuickReplyButton(Box::new(nx!(
+                    htb::HydratedQuickReplyButton {
+                        display_text: Some(label.to_string()),
+                        id: Some(id.to_string()),
+                    }
+                )))),
+            })
+        }
+
+        fn template(hydrated: wm::template_message::HydratedFourRowTemplate) -> Message {
+            nx!(Message {
+                template_message: MessageField::some(nx!(wm::TemplateMessage {
+                    format: Some(wm::template_message::Format::HydratedFourRowTemplate(
+                        Box::new(hydrated)
+                    )),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })
+        }
+
+        #[test]
+        fn a_template_offers_its_quick_replies_and_skips_link_buttons() {
+            let msg = template(nx!(wm::template_message::HydratedFourRowTemplate {
+                hydrated_content_text: Some("Your order is ready. Confirm below.".to_string()),
+                hydrated_buttons: vec![
+                    quick_reply("CONFIRM", "Confirm", 0),
+                    quick_reply("CANCEL", "Cancel", 2),
+                    nx!(HydratedTemplateButton {
+                        index: Some(1),
+                        hydrated_button: Some(htb::HydratedButton::UrlButton(Box::new(nx!(
+                            htb::HydratedURLButton {
+                                display_text: Some("Track".to_string()),
+                                url: Some("https://example.com/track".to_string()),
+                                ..Default::default()
+                            }
+                        )))),
+                    }),
+                ],
+                ..Default::default()
+            }));
+            let data = message_event_data(&msg, &info(), None, None);
+            assert_eq!(data["message_type"], "template");
+            assert_eq!(data["text"], "Your order is ready. Confirm below.");
+            assert_eq!(
+                data["choices"],
+                json!([
+                    { "id": "CONFIRM", "text": "Confirm", "index": 0 },
+                    { "id": "CANCEL", "text": "Cancel", "index": 2 },
+                ])
+            );
+        }
+
+        #[test]
+        fn a_template_reads_the_hydrated_template_field_and_falls_back_to_position() {
+            let mut first = quick_reply("YES", "Yes", 0);
+            first.index = None;
+            let mut second = quick_reply("NO", "No", 0);
+            second.index = None;
+            let msg = nx!(Message {
+                ephemeral_message: MessageField::some(nx!(wm::FutureProofMessage {
+                    message: MessageField::some(nx!(Message {
+                        template_message: MessageField::some(nx!(wm::TemplateMessage {
+                            hydrated_template: MessageField::some(nx!(
+                                wm::template_message::HydratedFourRowTemplate {
+                                    hydrated_content_text: Some("Continue?".to_string()),
+                                    hydrated_buttons: vec![first, second],
+                                    ..Default::default()
+                                }
+                            )),
+                            ..Default::default()
+                        })),
+                        ..Default::default()
+                    })),
+                })),
+                ..Default::default()
+            });
+            let data = message_event_data(&msg, &info(), None, None);
+            assert_eq!(data["message_type"], "template");
+            assert_eq!(data["text"], "Continue?");
+            assert_eq!(
+                data["choices"],
+                json!([
+                    { "id": "YES", "text": "Yes", "index": 0 },
+                    { "id": "NO", "text": "No", "index": 1 },
+                ])
+            );
+        }
+
+        #[test]
+        fn a_buttons_message_offers_its_buttons() {
+            let button = |id: &str, label: &str| {
+                nx!(wm::buttons_message::Button {
+                    button_id: Some(id.to_string()),
+                    button_text: MessageField::some(nx!(wm::buttons_message::button::ButtonText {
+                        display_text: Some(label.to_string()),
+                    })),
+                    ..Default::default()
+                })
+            };
+            let msg = nx!(Message {
+                buttons_message: MessageField::some(nx!(wm::ButtonsMessage {
+                    content_text: Some("Approve the transfer?".to_string()),
+                    footer_text: Some("footer".to_string()),
+                    buttons: vec![button("approve", "Approve"), button("reject", "Reject")],
+                    ..Default::default()
+                })),
+                ..Default::default()
+            });
+            let data = message_event_data(&msg, &info(), None, None);
+            assert_eq!(data["message_type"], "buttons");
+            assert_eq!(data["text"], "Approve the transfer?");
+            assert_eq!(
+                data["choices"],
+                json!([
+                    { "id": "approve", "text": "Approve", "index": 0 },
+                    { "id": "reject", "text": "Reject", "index": 1 },
+                ])
+            );
+        }
+
+        #[test]
+        fn a_list_offers_every_row_across_sections() {
+            let row = |id: &str, title: &str| {
+                nx!(wm::list_message::Row {
+                    title: Some(title.to_string()),
+                    row_id: Some(id.to_string()),
+                    ..Default::default()
+                })
+            };
+            let msg = nx!(Message {
+                list_message: MessageField::some(nx!(wm::ListMessage {
+                    title: Some("Delivery".to_string()),
+                    description: Some("Pick a slot".to_string()),
+                    sections: vec![
+                        nx!(wm::list_message::Section {
+                            title: Some("Today".to_string()),
+                            rows: vec![row("am", "Morning"), row("pm", "Afternoon")],
+                        }),
+                        nx!(wm::list_message::Section {
+                            title: Some("Tomorrow".to_string()),
+                            rows: vec![row("next", "Any time")],
+                        }),
+                    ],
+                    ..Default::default()
+                })),
+                ..Default::default()
+            });
+            let data = message_event_data(&msg, &info(), None, None);
+            assert_eq!(data["message_type"], "list");
+            assert_eq!(data["text"], "Delivery\nPick a slot");
+            assert_eq!(
+                data["choices"],
+                json!([
+                    { "id": "am", "text": "Morning", "index": 0 },
+                    { "id": "pm", "text": "Afternoon", "index": 1 },
+                    { "id": "next", "text": "Any time", "index": 2 },
+                ])
+            );
+        }
+
+        #[test]
+        fn a_native_flow_offers_only_its_quick_replies() {
+            let button = |name: &str, params: &str| {
+                nx!(
+                    wm::interactive_message::native_flow_message::NativeFlowButton {
+                        name: Some(name.to_string()),
+                        button_params_json: Some(params.to_string()),
+                    }
+                )
+            };
+            let msg = nx!(Message {
+                interactive_message: MessageField::some(nx!(wm::InteractiveMessage {
+                    body: MessageField::some(nx!(wm::interactive_message::Body {
+                        text: Some("Setuju dengan jadwal ini?".to_string()),
+                    })),
+                    interactive_message: Some(
+                        wm::interactive_message::InteractiveMessage::NativeFlowMessage(Box::new(
+                            nx!(wm::interactive_message::NativeFlowMessage {
+                                buttons: vec![
+                                    button(
+                                        "cta_url",
+                                        r#"{"display_text":"Open","url":"https://example.com"}"#
+                                    ),
+                                    button("quick_reply", r#"{"display_text":"Ya","id":"yes"}"#),
+                                    button("quick_reply", r#"{"display_text":"Tidak","id":"no"}"#),
+                                ],
+                                ..Default::default()
+                            })
+                        )),
+                    ),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            });
+            let data = message_event_data(&msg, &info(), None, None);
+            assert_eq!(data["message_type"], "interactive");
+            assert_eq!(data["text"], "Setuju dengan jadwal ini?");
+            assert_eq!(
+                data["choices"],
+                json!([
+                    { "id": "yes", "text": "Ya", "index": 0 },
+                    { "id": "no", "text": "Tidak", "index": 1 },
+                ])
+            );
+        }
+
+        #[test]
+        fn a_plain_text_message_offers_no_choices() {
+            let msg = nx!(Message {
+                conversation: Some("hi".to_string()),
+                ..Default::default()
+            });
+            let data = message_event_data(&msg, &info(), None, None);
+            assert_eq!(data["message_type"], "text");
+            assert_eq!(data.get("choices"), Some(&serde_json::Value::Null));
         }
     }
 
