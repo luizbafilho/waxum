@@ -560,9 +560,14 @@ pub(super) fn message_event_data(
         .as_ref()
         .filter(|s| s.flow_name.is_some() || s.flow_params.is_some())
         .map(|s| serde_json::json!({ "name": s.flow_name, "params": s.flow_params }));
-    let choices = extract_interactive_offer(msg)
-        .map(|offer| offer.choices)
-        .filter(|choices| !choices.is_empty());
+    let (choices, links) = extract_interactive_offer(msg)
+        .map(|offer| {
+            (
+                Some(offer.choices).filter(|choices| !choices.is_empty()),
+                Some(offer.links).filter(|links| !links.is_empty()),
+            )
+        })
+        .unwrap_or_default();
     serde_json::json!({
         "from": info.source.sender.to_string(),
         "from_phone": from_phone,
@@ -589,6 +594,7 @@ pub(super) fn message_event_data(
         "selected_text": selection.as_ref().and_then(|s| s.text.clone()),
         "native_flow": native_flow,
         "choices": choices,
+        "links": links,
         "is_group": info.source.chat.to_string().ends_with("@g.us"),
         "participant": info.source.sender.to_string(),
     })
@@ -841,6 +847,9 @@ pub(crate) struct InteractiveOffer {
     /// The choices that send a reply when tapped, in display order. URL,
     /// call and other non-reply buttons are left out.
     pub choices: Vec<OfferedChoice>,
+    /// The buttons that open a URL instead of sending a reply, in display
+    /// order.
+    pub links: Vec<OfferedLink>,
 }
 
 /// One tappable choice; `id` is what the reply carries back as
@@ -850,6 +859,13 @@ pub(crate) struct OfferedChoice {
     pub id: String,
     pub text: String,
     pub index: u32,
+}
+
+/// A button that opens `url` when tapped.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub(crate) struct OfferedLink {
+    pub text: String,
+    pub url: String,
 }
 
 /// Reads the body and reply choices out of a template, buttons, list or
@@ -877,10 +893,23 @@ pub(crate) fn extract_interactive_offer(
                 _ => None,
             })
             .collect();
+        let links = hydrated
+            .map(|h| h.hydrated_buttons.as_slice())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|button| match &button.hydrated_button {
+                Some(HydratedButton::UrlButton(u)) => Some(OfferedLink {
+                    text: u.display_text.clone().unwrap_or_default(),
+                    url: u.url.clone()?,
+                }),
+                _ => None,
+            })
+            .collect();
         return Some(InteractiveOffer {
             kind: "template",
             text: hydrated.and_then(|h| h.hydrated_content_text.clone()),
             choices,
+            links,
         });
     }
     if let Some(b) = msg.buttons_message.as_option() {
@@ -901,6 +930,7 @@ pub(crate) fn extract_interactive_offer(
                     index: position as u32,
                 })
                 .collect(),
+            links: Vec::new(),
         });
     }
     if let Some(l) = msg.list_message.as_option() {
@@ -924,6 +954,7 @@ pub(crate) fn extract_interactive_offer(
                     index: position as u32,
                 })
                 .collect(),
+            links: Vec::new(),
         });
     }
     if let Some(i) = msg.interactive_message.as_option() {
@@ -946,10 +977,24 @@ pub(crate) fn extract_interactive_offer(
                 })
             })
             .collect();
+        let links = buttons
+            .iter()
+            .filter(|button| button.name.as_deref() == Some("cta_url"))
+            .filter_map(|button| {
+                let params: serde_json::Value =
+                    serde_json::from_str(button.button_params_json.as_deref()?).ok()?;
+                let field = |key: &str| params.get(key)?.as_str().map(str::to_string);
+                Some(OfferedLink {
+                    text: field("display_text").unwrap_or_default(),
+                    url: field("url")?,
+                })
+            })
+            .collect();
         return Some(InteractiveOffer {
             kind: "interactive",
             text: i.body.as_option().and_then(|b| b.text.clone()),
             choices,
+            links,
         });
     }
     None
