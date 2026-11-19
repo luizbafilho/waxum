@@ -1729,7 +1729,7 @@ mod tests {
         }
 
         #[test]
-        fn a_template_offers_its_quick_replies_and_skips_link_buttons() {
+        fn a_template_offers_its_quick_replies_and_lists_its_link_buttons() {
             let msg = template(nx!(wm::template_message::HydratedFourRowTemplate {
                 hydrated_content_text: Some("Your order is ready. Confirm below.".to_string()),
                 hydrated_buttons: vec![
@@ -1757,6 +1757,10 @@ mod tests {
                     { "id": "CONFIRM", "text": "Confirm", "index": 0 },
                     { "id": "CANCEL", "text": "Cancel", "index": 2 },
                 ])
+            );
+            assert_eq!(
+                data["links"],
+                json!([{ "text": "Track", "url": "https://example.com/track" }])
             );
         }
 
@@ -1869,7 +1873,7 @@ mod tests {
         }
 
         #[test]
-        fn a_native_flow_offers_only_its_quick_replies() {
+        fn a_native_flow_offers_its_quick_replies_and_lists_its_url_buttons() {
             let button = |name: &str, params: &str| {
                 nx!(
                     wm::interactive_message::native_flow_message::NativeFlowButton {
@@ -1912,6 +1916,47 @@ mod tests {
                     { "id": "no", "text": "Tidak", "index": 1 },
                 ])
             );
+            assert_eq!(
+                data["links"],
+                json!([{ "text": "Open", "url": "https://example.com" }])
+            );
+        }
+
+        #[test]
+        fn a_native_flow_with_only_a_url_button_lists_its_link() {
+            let msg = nx!(Message {
+                interactive_message: MessageField::some(nx!(wm::InteractiveMessage {
+                    body: MessageField::some(nx!(wm::interactive_message::Body {
+                        text: Some("Clique no botao abaixo.".to_string()),
+                    })),
+                    interactive_message: Some(
+                        wm::interactive_message::InteractiveMessage::NativeFlowMessage(Box::new(
+                            nx!(wm::interactive_message::NativeFlowMessage {
+                                buttons: vec![nx!(
+                                    wm::interactive_message::native_flow_message::NativeFlowButton {
+                                        name: Some("cta_url".to_string()),
+                                        button_params_json: Some(
+                                            r#"{"display_text":"Iniciar atendimento","url":"https://example.com/agendar","merchant_url":"https://example.com/agendar"}"#
+                                                .to_string()
+                                        ),
+                                    }
+                                )],
+                                ..Default::default()
+                            })
+                        )),
+                    ),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            });
+            let data = message_event_data(&msg, &info(), None, None);
+            assert_eq!(data["message_type"], "interactive");
+            assert_eq!(data["text"], "Clique no botao abaixo.");
+            assert_eq!(data.get("choices"), Some(&serde_json::Value::Null));
+            assert_eq!(
+                data["links"],
+                json!([{ "text": "Iniciar atendimento", "url": "https://example.com/agendar" }])
+            );
         }
 
         #[test]
@@ -1923,6 +1968,7 @@ mod tests {
             let data = message_event_data(&msg, &info(), None, None);
             assert_eq!(data["message_type"], "text");
             assert_eq!(data.get("choices"), Some(&serde_json::Value::Null));
+            assert_eq!(data.get("links"), Some(&serde_json::Value::Null));
         }
     }
 
