@@ -386,18 +386,132 @@ pub(super) fn get_event_type(event: &wacore::types::events::Event) -> String {
     }
 }
 
-/// Build the metadata blob a downstream consumer needs to call
-/// /sessions/:id/media/download for an inbound media message. Returns null
-/// for non-media or text-only messages.
-pub(super) fn extract_media_metadata(msg: &waproto::whatsapp::Message) -> serde_json::Value {
+enum MediaRef<'a> {
+    Image(&'a waproto::whatsapp::message::ImageMessage),
+    Video(&'a waproto::whatsapp::message::VideoMessage),
+    Audio(&'a waproto::whatsapp::message::AudioMessage),
+    Document(&'a waproto::whatsapp::message::DocumentMessage),
+    Sticker(&'a waproto::whatsapp::message::StickerMessage),
+}
+
+impl MediaRef<'_> {
+    fn mimetype(&self) -> Option<String> {
+        match self {
+            Self::Image(m) => m.mimetype.clone(),
+            Self::Video(m) => m.mimetype.clone(),
+            Self::Audio(m) => m.mimetype.clone(),
+            Self::Document(m) => m.mimetype.clone(),
+            Self::Sticker(m) => m.mimetype.clone(),
+        }
+    }
+}
+
+fn interactive_media(i: &waproto::whatsapp::message::InteractiveMessage) -> Option<MediaRef<'_>> {
+    use waproto::whatsapp::message::interactive_message::{footer, header};
+
+    if let Some(media) = i.header.as_option().and_then(|h| h.media.as_ref()) {
+        match media {
+            header::Media::DocumentMessage(dm) => return Some(MediaRef::Document(dm)),
+            header::Media::ImageMessage(im) => return Some(MediaRef::Image(im)),
+            header::Media::VideoMessage(vm) => return Some(MediaRef::Video(vm)),
+            _ => {}
+        }
+    }
+    if let Some(footer::Media::AudioMessage(am)) =
+        i.footer.as_option().and_then(|f| f.media.as_ref())
+    {
+        return Some(MediaRef::Audio(am));
+    }
+    None
+}
+
+fn template_media(t: &waproto::whatsapp::message::TemplateMessage) -> Option<MediaRef<'_>> {
+    use waproto::whatsapp::message::template_message::{
+        four_row_template, hydrated_four_row_template, Format,
+    };
+
+    if let Some(title) = hydrated_template(t).and_then(|h| h.title.as_ref()) {
+        match title {
+            hydrated_four_row_template::Title::DocumentMessage(dm) => {
+                return Some(MediaRef::Document(dm));
+            }
+            hydrated_four_row_template::Title::ImageMessage(im) => {
+                return Some(MediaRef::Image(im));
+            }
+            hydrated_four_row_template::Title::VideoMessage(vm) => {
+                return Some(MediaRef::Video(vm));
+            }
+            _ => {}
+        }
+    }
+    match &t.format {
+        Some(Format::FourRowTemplate(f)) => match f.title.as_ref() {
+            Some(four_row_template::Title::DocumentMessage(dm)) => Some(MediaRef::Document(dm)),
+            Some(four_row_template::Title::ImageMessage(im)) => Some(MediaRef::Image(im)),
+            Some(four_row_template::Title::VideoMessage(vm)) => Some(MediaRef::Video(vm)),
+            _ => None,
+        },
+        Some(Format::InteractiveMessageTemplate(i)) => interactive_media(i),
+        _ => None,
+    }
+}
+
+/// Finds the media attachment carried directly on `msg` or in the header of
+/// a template, buttons or interactive message.
+fn find_media(msg: &waproto::whatsapp::Message) -> Option<MediaRef<'_>> {
+    use waproto::whatsapp::message::buttons_message::Header as ButtonsHeader;
+
     let msg = msg.get_base_message();
+    if let Some(im) = msg.image_message.as_option() {
+        return Some(MediaRef::Image(im));
+    }
+    if let Some(vm) = msg.video_message.as_option() {
+        return Some(MediaRef::Video(vm));
+    }
+    if let Some(am) = msg.audio_message.as_option() {
+        return Some(MediaRef::Audio(am));
+    }
+    if let Some(dm) = msg.document_message.as_option() {
+        return Some(MediaRef::Document(dm));
+    }
+    if let Some(sm) = msg.sticker_message.as_option() {
+        return Some(MediaRef::Sticker(sm));
+    }
+    if let Some(t) = msg.template_message.as_option() {
+        if let Some(media) = template_media(t) {
+            return Some(media);
+        }
+    }
+    if let Some(header) = msg
+        .buttons_message
+        .as_option()
+        .and_then(|b| b.header.as_ref())
+    {
+        match header {
+            ButtonsHeader::DocumentMessage(dm) => return Some(MediaRef::Document(dm)),
+            ButtonsHeader::ImageMessage(im) => return Some(MediaRef::Image(im)),
+            ButtonsHeader::VideoMessage(vm) => return Some(MediaRef::Video(vm)),
+            _ => {}
+        }
+    }
+    if let Some(i) = msg.interactive_message.as_option() {
+        return interactive_media(i);
+    }
+    None
+}
+
+/// Build the metadata blob a downstream consumer needs to call
+/// /sessions/:id/media/download for an inbound media message or an
+/// interactive/template message with a media header. Returns null for
+/// non-media or text-only messages.
+pub(super) fn extract_media_metadata(msg: &waproto::whatsapp::Message) -> serde_json::Value {
     use base64::Engine as _;
     fn b64(b: &[u8]) -> String {
         base64::engine::general_purpose::STANDARD.encode(b)
     }
 
-    if let Some(im) = msg.image_message.as_option() {
-        return serde_json::json!({
+    match find_media(msg) {
+        Some(MediaRef::Image(im)) => serde_json::json!({
             "kind": "image",
             "direct_path": im.direct_path,
             "media_key": im.media_key.as_ref().map(|b| b64(b)),
@@ -407,10 +521,8 @@ pub(super) fn extract_media_metadata(msg: &waproto::whatsapp::Message) -> serde_
             "mimetype": im.mimetype,
             "width": im.width,
             "height": im.height,
-        });
-    }
-    if let Some(vm) = msg.video_message.as_option() {
-        return serde_json::json!({
+        }),
+        Some(MediaRef::Video(vm)) => serde_json::json!({
             "kind": "video",
             "direct_path": vm.direct_path,
             "media_key": vm.media_key.as_ref().map(|b| b64(b)),
@@ -419,10 +531,8 @@ pub(super) fn extract_media_metadata(msg: &waproto::whatsapp::Message) -> serde_
             "file_length": vm.file_length,
             "mimetype": vm.mimetype,
             "seconds": vm.seconds,
-        });
-    }
-    if let Some(am) = msg.audio_message.as_option() {
-        return serde_json::json!({
+        }),
+        Some(MediaRef::Audio(am)) => serde_json::json!({
             "kind": "audio",
             "direct_path": am.direct_path,
             "media_key": am.media_key.as_ref().map(|b| b64(b)),
@@ -432,10 +542,8 @@ pub(super) fn extract_media_metadata(msg: &waproto::whatsapp::Message) -> serde_
             "mimetype": am.mimetype,
             "seconds": am.seconds,
             "ptt": am.ptt,
-        });
-    }
-    if let Some(dm) = msg.document_message.as_option() {
-        return serde_json::json!({
+        }),
+        Some(MediaRef::Document(dm)) => serde_json::json!({
             "kind": "document",
             "direct_path": dm.direct_path,
             "media_key": dm.media_key.as_ref().map(|b| b64(b)),
@@ -444,10 +552,8 @@ pub(super) fn extract_media_metadata(msg: &waproto::whatsapp::Message) -> serde_
             "file_length": dm.file_length,
             "mimetype": dm.mimetype,
             "file_name": dm.file_name,
-        });
-    }
-    if let Some(sm) = msg.sticker_message.as_option() {
-        return serde_json::json!({
+        }),
+        Some(MediaRef::Sticker(sm)) => serde_json::json!({
             "kind": "sticker",
             "direct_path": sm.direct_path,
             "media_key": sm.media_key.as_ref().map(|b| b64(b)),
@@ -455,9 +561,9 @@ pub(super) fn extract_media_metadata(msg: &waproto::whatsapp::Message) -> serde_
             "file_enc_sha256": sm.file_enc_sha256.as_ref().map(|b| b64(b)),
             "file_length": sm.file_length,
             "mimetype": sm.mimetype,
-        });
+        }),
+        None => serde_json::Value::Null,
     }
-    serde_json::Value::Null
 }
 
 /// Typed counterpart to [`extract_media_metadata`] for message-history
@@ -494,23 +600,13 @@ pub(crate) fn extract_media_pointer(
         };
     }
 
-    let msg = msg.get_base_message();
-    if let Some(im) = msg.image_message.as_option() {
-        return pointer!(im, "image");
+    match find_media(msg)? {
+        MediaRef::Image(im) => pointer!(im, "image"),
+        MediaRef::Video(vm) => pointer!(vm, "video"),
+        MediaRef::Audio(am) => pointer!(am, "audio"),
+        MediaRef::Document(dm) => pointer!(dm, "document"),
+        MediaRef::Sticker(sm) => pointer!(sm, "sticker"),
     }
-    if let Some(vm) = msg.video_message.as_option() {
-        return pointer!(vm, "video");
-    }
-    if let Some(am) = msg.audio_message.as_option() {
-        return pointer!(am, "audio");
-    }
-    if let Some(dm) = msg.document_message.as_option() {
-        return pointer!(dm, "document");
-    }
-    if let Some(sm) = msg.sticker_message.as_option() {
-        return pointer!(sm, "sticker");
-    }
-    None
 }
 
 /// Extracts location data (lat/lng + optional name/address/url) from a
@@ -728,6 +824,7 @@ pub(crate) fn extract_message_content(
         } else if let Some(offer) = extract_interactive_offer(msg) {
             message_type = offer.kind.to_string();
             text = offer.text;
+            media_mimetype = find_media(msg).and_then(|m| m.mimetype());
         } else if let Some(selection) = extract_interactive_selection(msg) {
             message_type = selection.kind.to_string();
             text = selection.text.or(selection.id);
@@ -2002,6 +2099,102 @@ mod tests {
                 data["links"],
                 json!([{ "text": "Iniciar atendimento", "url": "https://example.com/agendar" }])
             );
+        }
+
+        #[test]
+        fn a_template_carries_its_document_header_in_media_and_pointer() {
+            let doc = nx!(wm::DocumentMessage {
+                direct_path: Some("/v/t62.7119-24/statement.enc".to_string()),
+                media_key: Some(vec![1; 32]),
+                file_sha256: Some(vec![2; 32]),
+                file_enc_sha256: Some(vec![3; 32]),
+                file_length: Some(363_142),
+                mimetype: Some("application/pdf".to_string()),
+                file_name: Some("Statement_November_2026.pdf".to_string()),
+                ..Default::default()
+            });
+            let msg = nx!(Message {
+                template_message: MessageField::some(nx!(wm::TemplateMessage {
+                    hydrated_template: MessageField::some(nx!(
+                        wm::template_message::HydratedFourRowTemplate {
+                            title: Some(
+                                wm::template_message::hydrated_four_row_template::Title::DocumentMessage(
+                                    Box::new(doc),
+                                )
+                            ),
+                            hydrated_content_text: Some(
+                                "Your monthly statement is ready.".to_string()
+                            ),
+                            ..Default::default()
+                        }
+                    )),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            });
+
+            let data = message_event_data(&msg, &info(), None, None);
+            assert_eq!(data["message_type"], "template");
+            assert_eq!(data["text"], "Your monthly statement is ready.");
+            assert_eq!(data["media_mimetype"], "application/pdf");
+            assert_eq!(data["media"]["kind"], "document");
+            assert_eq!(data["media"]["file_name"], "Statement_November_2026.pdf");
+            assert_eq!(data["media"]["direct_path"], "/v/t62.7119-24/statement.enc");
+            assert_eq!(data["media"]["file_length"], 363_142);
+
+            let ptr = extract_media_pointer(&msg).expect("template document pointer");
+            assert_eq!(ptr.media_type, "document");
+            assert_eq!(ptr.mimetype, "application/pdf");
+            assert_eq!(ptr.file_length, 363_142);
+        }
+
+        #[test]
+        fn buttons_and_interactive_headers_carry_their_media() {
+            let image = || {
+                nx!(wm::ImageMessage {
+                    direct_path: Some("/v/t62.7118-24/banner.enc".to_string()),
+                    media_key: Some(vec![4; 32]),
+                    file_sha256: Some(vec![5; 32]),
+                    file_enc_sha256: Some(vec![6; 32]),
+                    file_length: Some(12_345),
+                    mimetype: Some("image/jpeg".to_string()),
+                    ..Default::default()
+                })
+            };
+
+            let buttons = nx!(Message {
+                buttons_message: MessageField::some(nx!(wm::ButtonsMessage {
+                    content_text: Some("Check this out".to_string()),
+                    header: Some(wm::buttons_message::Header::ImageMessage(Box::new(image()))),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            });
+            let buttons_data = message_event_data(&buttons, &info(), None, None);
+            assert_eq!(buttons_data["message_type"], "buttons");
+            assert_eq!(buttons_data["media"]["kind"], "image");
+            assert_eq!(buttons_data["media_mimetype"], "image/jpeg");
+
+            let interactive = nx!(Message {
+                interactive_message: MessageField::some(nx!(wm::InteractiveMessage {
+                    header: MessageField::some(nx!(wm::interactive_message::Header {
+                        has_media_attachment: Some(true),
+                        media: Some(wm::interactive_message::header::Media::ImageMessage(
+                            Box::new(image()),
+                        )),
+                        ..Default::default()
+                    })),
+                    body: MessageField::some(nx!(wm::interactive_message::Body {
+                        text: Some("See header".to_string()),
+                    })),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            });
+            let interactive_data = message_event_data(&interactive, &info(), None, None);
+            assert_eq!(interactive_data["message_type"], "interactive");
+            assert_eq!(interactive_data["media"]["kind"], "image");
+            assert_eq!(interactive_data["media_mimetype"], "image/jpeg");
         }
 
         #[test]
